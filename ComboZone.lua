@@ -47,40 +47,48 @@ local function _differenceBetweenInsideZones(insideZones, newInsideZones)
   return isDifferent, enteredZones, leftZones
 end
 
-local function _getZoneBounds(zone)
-  local center = zone.center
+local function _circleRectCollide(circleX, circleY, radius, rectX, rectY, rectWidth, rectLength)
+  -- temporary variables to set edges for testing
+  local testX = circleX
+  local testY = circleY
+
+  -- which edge is closest?
+  if circleX < rectX then testX = rectX      					                    -- test left edge
+  elseif circleX > rectX + rectWidth then testX = rectX + rectWidth end   -- right edge
+  if circleY < rectY then testY = rectY     		                          -- top edge
+  elseif circleY > rectY + rectLength then testY = rectY + rectLength end -- bottom edge
+
+  -- get distance from closest edges
+  local distX = circleX - testX
+  local distY = circleY - testY
+
+	return distX * distX + distY * distY < radius * radius
+end
+
+local function _addZoneToRows(rows, zone)
   local radius = zone.radius or zone.boundingRadius
-  local minY = (center.y - radius - mapMinY) // yDelta
-  local maxY = (center.y + radius - mapMinY) // yDelta
-  local minX = (center.x - radius - mapMinX) // xDelta
-  local maxX = (center.x + radius - mapMinX) // xDelta
-  return minY, maxY, minX, maxX
+  local minY = (zone.center.y - radius - mapMinY) // yDelta
+  local maxY = (zone.center.y + radius - mapMinY) // yDelta
+  for i=minY, maxY do
+    local row = rows[i] or {}
+    row[#row+1] = zone
+    rows[i] = row
+  end
 end
 
-local function _removeZoneByFunction(predicateFn, zones)
-  if predicateFn == nil or zones == nil or #zones == 0 then return end
-
-  for i=1, #zones do
-    local possibleZone = zones[i]
-    if possibleZone and predicateFn(possibleZone) then
-      table.remove(zones, i)
-      return possibleZone
+local function _zonesInGridCell(x, y, zones)
+  local zonesInCell = {}
+  local startX = mapMinX + xDelta * x
+  local startY = mapMinY + yDelta * y
+  for _, zone in ipairs(zones) do
+    -- For each zone, append to zonesInCell IF it is inside the grid cell at x,y
+    local zoneCenter = zone.center
+    local radius = zone.radius or zone.boundingRadius
+    if _circleRectCollide(zoneCenter.x, zoneCenter.y, radius, startX, startY, xDelta, yDelta) then
+      zonesInCell[#zonesInCell+1] = zone
     end
   end
-  return nil
-end
-
-local function _addZoneToGrid(grid, zone)
-  local minY, maxY, minX, maxX = _getZoneBounds(zone)
-  for y=minY, maxY do
-    local row = grid[y] or {}
-    for x=minX, maxX do
-      local cell = row[x] or {}
-      cell[#cell+1] = zone
-      row[x] = cell
-    end
-    grid[y] = row
-  end
+  return zonesInCell
 end
 
 local function _getGridCell(pos)
@@ -90,12 +98,12 @@ local function _getGridCell(pos)
 end
 
 
-function ComboZone:draw(forceDraw)
+function ComboZone:draw()
   local zones = self.zones
   for i=1, #zones do
     local zone = zones[i]
     if zone and not zone.destroyed then
-      zone:draw(forceDraw)
+      zone:draw()
     end
   end
 end
@@ -106,10 +114,10 @@ local function _initDebug(zone, options)
   if not options.debugPoly then
     return
   end
-
+  
   Citizen.CreateThread(function()
     while not zone.destroyed do
-      zone:draw(false)
+      zone:draw()
       Citizen.Wait(0)
     end
   end)
@@ -117,24 +125,26 @@ end
 
 function ComboZone:new(zones, options)
   options = options or {}
-  local useGrid = options.useGrid
-  if useGrid == nil then useGrid = true end
-
-  local grid = {}
-  -- Add a unique id for each zone in the ComboZone and add to grid cache
+  local rows = {}
+  -- Add a unique id for each zone in the ComboZone and add to rows cache
   for i=1, #zones do
     local zone = zones[i]
     if zone then
       zone.id = i
     end
-    if useGrid then _addZoneToGrid(grid, zone) end
+    _addZoneToRows(rows, zone)
   end
 
+  local useGrid = options.useGrid
+  if useGrid == nil and #zones >= 25 then
+    useGrid = true
+  end
   local zone = {
     name = tostring(options.name) or nil,
     zones = zones,
     useGrid = useGrid,
-    grid = grid,
+    rows = rows,
+    grid = {},
     debugPoly = options.debugPoly or false,
     data = options.data or {},
     isComboZone = true,
@@ -157,14 +167,19 @@ function ComboZone:getZones(point)
   if not self.useGrid then
     return self.zones
   end
-
+  
   local grid = self.grid
-  local x, y = _getGridCell(point)
-  local row = grid[y]
-  if row == nil or row[x] == nil then
-    return nil
+  local gridX, gridY = _getGridCell(point)
+  local row = grid[gridY]
+  if row == nil then
+    row = {}
   end
-  return row[x]
+  if row[gridX] == nil then
+    local zonesInCell = _zonesInGridCell(gridX, gridY, self.rows[gridY] or {})
+    row[gridX] = zonesInCell
+    grid[gridY] = row
+  end
+  return grid[gridY][gridX]
 end
 
 function ComboZone:AddZone(zone)
@@ -172,37 +187,12 @@ function ComboZone:AddZone(zone)
   local newIndex = #zones+1
   zone.id = newIndex
   zones[newIndex] = zone
-  if self.useGrid then
-    _addZoneToGrid(self.grid, zone)
+  self.grid = {}
+  _addZoneToRows(self.rows, zone)
+  if self.useGrid == nil and newIndex >= 25 then
+    self.useGrid = true
   end
   if self.debugBlip then zone:addDebugBlip() end
-end
-
-function ComboZone:RemoveZone(nameOrFn)
-  local predicateFn = nameOrFn
-  if type(nameOrFn) == "string" then
-    -- Create on the fly predicate function if nameOrFn is a string (zone name)
-    predicateFn = function (zone) return zone.name == nameOrFn end
-  elseif type(nameOrFn) ~= "function" then
-    return nil
-  end
-
-  -- Remove from zones table
-  local zone = _removeZoneByFunction(predicateFn, self.zones)
-  if not zone then return nil end
-
-  -- Remove from grid cache
-  local grid = self.grid
-  local minY, maxY, minX, maxX = _getZoneBounds(zone)
-  for y=minY, maxY do
-    local row = grid[y]
-    if row then
-      for x=minX, maxX do
-        _removeZoneByFunction(predicateFn, row[x])
-      end
-    end
-  end
-  return zone
 end
 
 function ComboZone:isPointInside(point, zoneName)
@@ -212,7 +202,7 @@ function ComboZone:isPointInside(point, zoneName)
   end
 
   local zones = self:getZones(point)
-  if not zones or #zones == 0 then return false end
+  if #zones == 0 then return false end
 
   for i=1, #zones do
     local zone = zones[i]
@@ -235,7 +225,7 @@ function ComboZone:isPointInsideExhaustive(point, insideZones)
     insideZones = {}
   end
   local zones = self:getZones(point)
-  if not zones or #zones == 0 then return false, insideZones end
+  if #zones == 0 then return false, insideZones end
   for i=1, #zones do
     local zone = zones[i]
     if zone and zone:isPointInside(point) then
